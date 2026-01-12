@@ -1,139 +1,146 @@
-import sqlite3
-import secrets
-import hashlib
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
+import hashlib
+from typing import Optional
 
-# --- CONFIGURAÇÃO DA API ---
-app = FastAPI(
-    title="M-Hash API",
-    description="Sistema de Auditoria Digital e Imutabilidade via SHA-256.",
-    version="1.0.0"
-)
+# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS (O LIVRO) ---
+class Conta(SQLModel, table=True):
+    api_key: str = Field(primary_key=True)
+    nome: str
+    saldo_restante: int = 1000
 
-# Configuração de CORS (Essencial para conectar com sites externos/Lovable)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOVA TABELA: O "Livro Razão" onde ficam os registros eternos
+class RegistroAudit(SQLModel, table=True):
+    hash_sha256: str = Field(primary_key=True)  # O Hash é a identidade única
+    nome_arquivo: str
+    data_registro: datetime
+    quem_registrou: str  # A API Key de quem pagou pela auditoria
 
-# --- BANCO DE DADOS ---
-def conectar_bd():
-    # O banco agora se chama 'mhash.db'
-    return sqlite3.connect("mhash.db")
+# Configura o SQLite (Arquivo de banco de dados)
+engine = create_engine("sqlite:///banco_mhash.db")
 
-def inicializar_banco():
-    conn = conectar_bd()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clientes (
-            api_key TEXT PRIMARY KEY,
-            nome_empresa TEXT,
-            creditos INTEGER,
-            status TEXT DEFAULT 'ATIVO'
-        )
-    ''')
-    
-    # Cria usuário ADMIN padrão para testes imediatos
-    # Use a chave 'mhash_admin_key' para testar agora
-    cursor.execute("""
-        INSERT OR IGNORE INTO clientes (api_key, nome_empresa, creditos) 
-        VALUES ('mhash_admin_key', 'Admin M-Hash', 9999)
-    """)
-    
-    conn.commit()
-    conn.close()
+def criar_tabelas():
+    SQLModel.metadata.create_all(engine)
 
-# Inicia o banco ao ligar o servidor
-inicializar_banco()
+def get_session():
+    with Session(engine) as session:
+        yield session
 
-# --- SEGURANÇA E COBRANÇA ---
-def verificar_acesso(x_api_key: str = Header(...)):
-    """
-    O Porteiro: Verifica se a chave existe e desconta o crédito.
-    """
-    conn = conectar_bd()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT creditos, status FROM clientes WHERE api_key = ?", (x_api_key,))
-    resultado = cursor.fetchone()
-    
-    if not resultado:
-        conn.close()
-        raise HTTPException(status_code=401, detail="M-Hash: Chave de acesso inválida.")
-    
-    creditos, status = resultado
-    
-    if status != 'ATIVO':
-        conn.close()
-        raise HTTPException(status_code=403, detail="M-Hash: Conta suspensa.")
+# --- 2. O APLICATIVO ---
+app = FastAPI()
 
-    if creditos <= 0:
-        conn.close()
-        raise HTTPException(status_code=402, detail="M-Hash: Saldo insuficiente.")
-    
-    # Debita o crédito
-    novo_saldo = creditos - 1
-    cursor.execute("UPDATE clientes SET creditos = ? WHERE api_key = ?", (novo_saldo, x_api_key))
-    conn.commit()
-    conn.close()
-    
-    return novo_saldo
+# Cria as tabelas ao iniciar
+@app.on_event("startup")
+def on_startup():
+    criar_tabelas()
+    # Cria a conta ADMIN se não existir
+    with Session(engine) as session:
+        admin = session.get(Conta, "mhash_admin_key")
+        if not admin:
+            session.add(Conta(api_key="mhash_admin_key", nome="Admin Master", saldo_restante=9999))
+            session.commit()
 
-# --- ROTAS DA API ---
+# --- 3. FUNÇÕES AUXILIARES ---
+def calcular_hash(conteudo: bytes) -> str:
+    return hashlib.sha256(conteudo).hexdigest()
 
-@app.get("/")
-def status_sistema():
-    return {
-        "sistema": "M-Hash",
-        "status": "ONLINE",
-        "mensagem": "Auditoria Digital Operacional"
-    }
+# --- 4. AS ROTAS (OS SERVIÇOS DO CARTÓRIO) ---
 
-@app.post("/admin/gerar-chave")
-def criar_cliente(nome_empresa: str, pacote_creditos: int):
-    """
-    Gera uma nova chave para você vender pro cliente.
-    """
-    nova_key = "live_" + secrets.token_hex(8)
-    conn = conectar_bd()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO clientes (api_key, nome_empresa, creditos) VALUES (?, ?, ?)", 
-                       (nova_key, nome_empresa, pacote_creditos))
-        conn.commit()
-    except:
-        conn.close()
-        return {"erro": "Falha ao criar cliente"}
-        
-    conn.close()
-    return {"mensagem": "Cliente M-Hash criado", "api_key": nova_key, "creditos": pacote_creditos}
-
+# Rota 1: AUDITAR (Gera o Hash, Cobra e Escreve no Livro)
 @app.post("/api/v1/auditar")
-async def processar_hash(
-    arquivo: UploadFile = File(...), 
-    saldo: int = Depends(verificar_acesso)
+async def auditar_arquivo(
+    arquivo: UploadFile = File(...),
+    x_api_key: str = Header(...),
+    session: Session = Depends(get_session)
 ):
-    """
-    Recebe arquivo -> Gera Hash -> Retorna Certificado.
-    """
+    # 1. Verifica se o cliente existe e tem saldo
+    cliente = session.get(Conta, x_api_key)
+    if not cliente:
+        raise HTTPException(status_code=401, detail="API Key inválida")
+    
+    if cliente.saldo_restante <= 0:
+        raise HTTPException(status_code=402, detail="Saldo insuficiente. Compre créditos.")
+
+    # 2. Processa o arquivo
     conteudo = await arquivo.read()
+    hash_gerado = calcular_hash(conteudo)
     
-    # O MOTOR (SHA-256)
-    hash_digital = hashlib.sha256(conteudo).hexdigest()
+    # 3. Verifica se já foi registrado antes (para não cobrar duas vezes à toa)
+    registro_existente = session.get(RegistroAudit, hash_gerado)
+    if registro_existente:
+        return {
+            "status": "JÁ REGISTRADO",
+            "mensagem": "Este arquivo já consta no livro oficial.",
+            "certificado_mhash": {
+                "hash_sha256": registro_existente.hash_sha256,
+                "data_registro": registro_existente.data_registro,
+                "registrado_por": registro_existente.quem_registrou
+            },
+            "conta": {
+                "cliente": cliente.nome,
+                "saldo_restante": cliente.saldo_restante  # Não cobra de novo
+            }
+        }
+
+    # 4. Cobra o crédito e SALVA NO LIVRO (A novidade!)
+    cliente.saldo_restante -= 1
+    session.add(cliente)
     
+    novo_registro = RegistroAudit(
+        hash_sha256=hash_gerado,
+        nome_arquivo=arquivo.filename,
+        data_registro=datetime.now(),
+        quem_registrou=cliente.api_key
+    )
+    session.add(novo_registro)
+    session.commit()
+    session.refresh(novo_registro)
+
+    # 5. Entrega o Recibo
     return {
+        "status": "SUCESSO",
+        "mensagem": "Arquivo auditado e registrado no Livro M-Hash.",
         "certificado_mhash": {
-            "arquivo": arquivo.filename,
-            "hash_sha256": hash_digital,
-            "autenticidade": "GARANTIDA",
-            "data_registro": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            "hash_sha256": novo_registro.hash_sha256,
+            "data_registro": novo_registro.data_registro,
+            "arquivo_original": novo_registro.nome_arquivo
         },
         "conta": {
-            "saldo_restante": saldo
+            "cliente": cliente.nome,
+            "saldo_restante": cliente.saldo_restante
         }
     }
+
+# Rota 2: VERIFICAR (Consulta o Livro - Grátis)
+@app.post("/api/v1/verificar")
+async def verificar_arquivo(
+    arquivo: UploadFile = File(...),
+    session: Session = Depends(get_session)
+):
+    # 1. Lê o arquivo e calcula o hash
+    conteudo = await arquivo.read()
+    hash_consulta = calcular_hash(conteudo)
+    
+    # 2. Busca no Livro
+    registro = session.get(RegistroAudit, hash_consulta)
+    
+    if registro:
+        return {
+            "status": "AUTÊNTICO",
+            "resultado": "✅ Arquivo Original Encontrado!",
+            "dados": {
+                "hash": registro.hash_sha256,
+                "data_original": registro.data_registro,
+                "nome_original": registro.nome_arquivo,
+                "registrado_por_api": registro.quem_registrou
+            }
+        }
+    else:
+        return {
+            "status": "DESCONHECIDO",
+            "resultado": "❌ Arquivo não encontrado ou modificado.",
+            "dados": {
+                "hash_calculado": hash_consulta
+            }
+        }
