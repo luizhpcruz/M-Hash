@@ -1,23 +1,22 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware  # <--- O SEGREDO ESTÁ AQUI
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
 import hashlib
 from typing import Optional
 
-# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS (O LIVRO) ---
+# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS ---
 class Conta(SQLModel, table=True):
     api_key: str = Field(primary_key=True)
     nome: str
     saldo_restante: int = 1000
 
-# NOVA TABELA: O "Livro Razão" onde ficam os registros eternos
 class RegistroAudit(SQLModel, table=True):
-    hash_sha256: str = Field(primary_key=True)  # O Hash é a identidade única
+    hash_sha256: str = Field(primary_key=True)
     nome_arquivo: str
     data_registro: datetime
-    quem_registrou: str  # A API Key de quem pagou pela auditoria
+    quem_registrou: str
 
-# Configura o SQLite (Arquivo de banco de dados)
 engine = create_engine("sqlite:///banco_mhash.db")
 
 def criar_tabelas():
@@ -30,11 +29,18 @@ def get_session():
 # --- 2. O APLICATIVO ---
 app = FastAPI()
 
-# Cria as tabelas ao iniciar
+# --- CONFIGURAÇÃO DO CORS (LIBERA O LOVABLE) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Libera acesso para todos (incluindo o Lovable)
+    allow_credentials=True,
+    allow_methods=["*"],  # Libera todos os métodos (GET, POST, OPTIONS)
+    allow_headers=["*"],  # Libera todos os cabeçalhos
+)
+
 @app.on_event("startup")
 def on_startup():
     criar_tabelas()
-    # Cria a conta ADMIN se não existir
     with Session(engine) as session:
         admin = session.get(Conta, "mhash_admin_key")
         if not admin:
@@ -45,28 +51,23 @@ def on_startup():
 def calcular_hash(conteudo: bytes) -> str:
     return hashlib.sha256(conteudo).hexdigest()
 
-# --- 4. AS ROTAS (OS SERVIÇOS DO CARTÓRIO) ---
-
-# Rota 1: AUDITAR (Gera o Hash, Cobra e Escreve no Livro)
+# --- 4. AS ROTAS ---
 @app.post("/api/v1/auditar")
 async def auditar_arquivo(
     arquivo: UploadFile = File(...),
     x_api_key: str = Header(...),
     session: Session = Depends(get_session)
 ):
-    # 1. Verifica se o cliente existe e tem saldo
     cliente = session.get(Conta, x_api_key)
     if not cliente:
         raise HTTPException(status_code=401, detail="API Key inválida")
     
     if cliente.saldo_restante <= 0:
-        raise HTTPException(status_code=402, detail="Saldo insuficiente. Compre créditos.")
+        raise HTTPException(status_code=402, detail="Saldo insuficiente.")
 
-    # 2. Processa o arquivo
     conteudo = await arquivo.read()
     hash_gerado = calcular_hash(conteudo)
     
-    # 3. Verifica se já foi registrado antes (para não cobrar duas vezes à toa)
     registro_existente = session.get(RegistroAudit, hash_gerado)
     if registro_existente:
         return {
@@ -79,11 +80,10 @@ async def auditar_arquivo(
             },
             "conta": {
                 "cliente": cliente.nome,
-                "saldo_restante": cliente.saldo_restante  # Não cobra de novo
+                "saldo_restante": cliente.saldo_restante
             }
         }
 
-    # 4. Cobra o crédito e SALVA NO LIVRO (A novidade!)
     cliente.saldo_restante -= 1
     session.add(cliente)
     
@@ -97,10 +97,9 @@ async def auditar_arquivo(
     session.commit()
     session.refresh(novo_registro)
 
-    # 5. Entrega o Recibo
     return {
         "status": "SUCESSO",
-        "mensagem": "Arquivo auditado e registrado no Livro M-Hash.",
+        "mensagem": "Arquivo auditado e registrado.",
         "certificado_mhash": {
             "hash_sha256": novo_registro.hash_sha256,
             "data_registro": novo_registro.data_registro,
@@ -112,17 +111,14 @@ async def auditar_arquivo(
         }
     }
 
-# Rota 2: VERIFICAR (Consulta o Livro - Grátis)
 @app.post("/api/v1/verificar")
 async def verificar_arquivo(
     arquivo: UploadFile = File(...),
     session: Session = Depends(get_session)
 ):
-    # 1. Lê o arquivo e calcula o hash
     conteudo = await arquivo.read()
     hash_consulta = calcular_hash(conteudo)
     
-    # 2. Busca no Livro
     registro = session.get(RegistroAudit, hash_consulta)
     
     if registro:
