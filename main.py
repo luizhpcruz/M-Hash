@@ -1,11 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware  # <--- O SEGREDO ESTÁ AQUI
+from fastapi.middleware.cors import CORSMiddleware  # IMPORTANTE: O Porteiro
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
 import hashlib
 from typing import Optional
 
-# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS ---
+# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS (O LIVRO) ---
 class Conta(SQLModel, table=True):
     api_key: str = Field(primary_key=True)
     nome: str
@@ -17,6 +17,7 @@ class RegistroAudit(SQLModel, table=True):
     data_registro: datetime
     quem_registrou: str
 
+# Cria o arquivo do banco de dados local
 engine = create_engine("sqlite:///banco_mhash.db")
 
 def criar_tabelas():
@@ -29,45 +30,53 @@ def get_session():
 # --- 2. O APLICATIVO ---
 app = FastAPI()
 
-# --- CONFIGURAÇÃO DO CORS (LIBERA O LOVABLE) ---
+# --- 3. CONFIGURAÇÃO DE SEGURANÇA (CORS) ---
+# Isso corrige o erro de "Offline" ou "Network Error" no Lovable
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Libera acesso para todos (incluindo o Lovable)
+    allow_origins=["*"],  # Permite que qualquer site (Lovable) acesse
     allow_credentials=True,
-    allow_methods=["*"],  # Libera todos os métodos (GET, POST, OPTIONS)
-    allow_headers=["*"],  # Libera todos os cabeçalhos
+    allow_methods=["*"],  # Permite todos os métodos (GET, POST, OPTIONS)
+    allow_headers=["*"],  # Permite todos os cabeçalhos (incluindo api-key)
 )
 
+# Cria as tabelas e o usuário Admin ao iniciar
 @app.on_event("startup")
 def on_startup():
     criar_tabelas()
     with Session(engine) as session:
+        # Cria a conta ADMIN se ela não existir
         admin = session.get(Conta, "mhash_admin_key")
         if not admin:
             session.add(Conta(api_key="mhash_admin_key", nome="Admin Master", saldo_restante=9999))
             session.commit()
 
-# --- 3. FUNÇÕES AUXILIARES ---
+# --- 4. FUNÇÃO AUXILIAR ---
 def calcular_hash(conteudo: bytes) -> str:
     return hashlib.sha256(conteudo).hexdigest()
 
-# --- 4. AS ROTAS ---
+# --- 5. AS ROTAS (OS SERVIÇOS) ---
+
+# Rota Paga: Auditar e Registrar
 @app.post("/api/v1/auditar")
 async def auditar_arquivo(
     arquivo: UploadFile = File(...),
     x_api_key: str = Header(...),
     session: Session = Depends(get_session)
 ):
+    # Verifica cliente
     cliente = session.get(Conta, x_api_key)
     if not cliente:
         raise HTTPException(status_code=401, detail="API Key inválida")
     
     if cliente.saldo_restante <= 0:
-        raise HTTPException(status_code=402, detail="Saldo insuficiente.")
+        raise HTTPException(status_code=402, detail="Saldo insuficiente")
 
+    # Processa arquivo
     conteudo = await arquivo.read()
     hash_gerado = calcular_hash(conteudo)
     
+    # Verifica se já existe
     registro_existente = session.get(RegistroAudit, hash_gerado)
     if registro_existente:
         return {
@@ -84,6 +93,7 @@ async def auditar_arquivo(
             }
         }
 
+    # Cobra e Salva
     cliente.saldo_restante -= 1
     session.add(cliente)
     
@@ -111,6 +121,7 @@ async def auditar_arquivo(
         }
     }
 
+# Rota Grátis: Verificar
 @app.post("/api/v1/verificar")
 async def verificar_arquivo(
     arquivo: UploadFile = File(...),
